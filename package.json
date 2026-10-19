@@ -1,0 +1,10 @@
+{
+  "name": "shunei-trainer",
+  "private": true,
+  "type": "module",
+  "description": "ビジネスシーン中心の瞬間英作文トレーニング（PWA）",
+  "scripts": {
+    "start": "python3 -m http.server 8765 --bind 127.0.0.1",
+    "test": "node --test tests/*.test.mjs"
+  }
+}
