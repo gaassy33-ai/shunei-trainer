@@ -329,6 +329,28 @@ h1, h2, p { margin: 0; }
   100% { box-shadow: 0 0 0 22px transparent; }
 }
 .mic-caption { font-size: 12px; color: var(--muted); text-align: center; }
+.mic-caption.go { color: var(--accent); font-weight: 700; font-size: 13px; }
+.transcript.wait { border-color: var(--warn); border-style: dashed; }
+.transcript .placeholder.go { font-size: 18px; font-weight: 800; color: var(--accent); }
+.mic-btn { -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; touch-action: none; }
+.mic-btn.wait { background: var(--surface-2); color: var(--warn); box-shadow: none; position: relative; }
+.mic-btn.wait::after {
+  content: ""; position: absolute; inset: -6px; border-radius: 50%;
+  border: 3px solid transparent; border-top-color: var(--warn); animation: spin 0.9s linear infinite;
+}
+.mic-btn.hold { width: 104px; height: 104px; }
+.mic-btn.hold svg { width: 40px; height: 40px; }
+.mic-btn.hold.on, .mic-btn.hold.wait { transform: scale(1.06); }
+
+/* 診断ログ */
+.diag { margin-top: 18px; border: 1px dashed var(--line); border-radius: var(--radius); padding: 8px 12px 12px; background: var(--surface); }
+.diag summary { font-size: 12px; font-weight: 800; color: var(--muted); cursor: pointer; }
+.diag-env { font-size: 11px; color: var(--faint); margin: 6px 0; }
+.diag pre {
+  margin: 0 0 8px; max-height: 220px; overflow: auto; padding: 8px 10px; border-radius: var(--radius-sm);
+  background: var(--surface-2); font: 11px/1.55 ui-monospace, "SF Mono", Menlo, monospace; white-space: pre-wrap; word-break: break-all;
+}
+.btn-sm { min-height: 34px; padding: 0 12px; font-size: 12px; border-radius: 10px; }
 
 .kbd-form { display: flex; flex-direction: column; gap: 10px; }
 .kbd-form textarea {
@@ -389,6 +411,12 @@ mark { background: var(--mark); color: inherit; border-radius: 4px; padding: 0 2
 .ai-better { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: var(--radius-sm); background: var(--surface-2); font-family: var(--font-en); font-size: 16px; font-weight: 600; }
 .ai-better > span:nth-child(2) { flex: 1; }
 .ai-tag { font-family: var(--font); font-size: 11px; font-weight: 800; color: var(--lv3); white-space: nowrap; }
+.ai-usage { font-size: 11px; color: var(--faint); }
+.usage-box { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+.usage-box > div { background: var(--surface-2); border-radius: var(--radius-sm); padding: 8px 6px; text-align: center; line-height: 1.3; }
+.usage-box b { display: block; font-size: 15px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.usage-box span { font-size: 10px; color: var(--muted); }
+.set-note { font-size: 11px; color: var(--faint); line-height: 1.6; }
 
 .alts { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
 .alts summary { padding: 12px 14px; font-size: 13px; font-weight: 700; color: var(--muted); cursor: pointer; }

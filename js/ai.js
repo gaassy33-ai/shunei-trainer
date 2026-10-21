@@ -3,10 +3,30 @@
 const SDK_URL = 'https://esm.sh/@anthropic-ai/sdk@0.131.0';
 
 export const AI_MODELS = [
-  { id: 'claude-opus-5-5', label: 'Claude Opus 5.5（高精度・推奨）' },
-  { id: 'claude-sonnet-5-5', label: 'Claude Sonnet 5.5（バランス）' },
-  { id: 'claude-haiku-5-5', label: 'Claude Haiku 5.5（高速・低コスト）' },
+  { id: 'claude-opus-5-5', label: 'Opus 5.5｜高精度・約1〜2円/回' },
+  { id: 'claude-sonnet-5-5', label: 'Sonnet 5.5｜バランス・約0.5〜1円/回' },
+  { id: 'claude-haiku-5-5', label: 'Haiku 5.5｜高速・約0.05円/回' },
 ];
+
+// 料金（米ドル / 100万トークン）。フォールバックで別モデルが応答した場合に備えて主要モデルも載せておく
+const PRICES = {
+  'claude-opus-5-5': { input: 4, output: 20 },
+  'claude-sonnet-5-5': { input: 2, output: 10 },
+  'claude-haiku-5-5': { input: 0.1, output: 0.5 },
+  'claude-opus-5': { input: 5, output: 25 },
+  'claude-opus-4-8': { input: 5, output: 25 },
+  'claude-sonnet-5': { input: 2, output: 10 },
+};
+// 円換算の目安レート
+export const USD_TO_JPY = 150;
+
+// usage（API の応答）から概算料金（米ドル）を計算する。思考トークンは出力トークンに含まれる
+export function estimateCost(model, usage, fallbackModel) {
+  const price = PRICES[model] || PRICES[fallbackModel] || PRICES['claude-opus-5-5'];
+  const input = (usage?.input_tokens || 0) + (usage?.cache_creation_input_tokens || 0) * 1.25 + (usage?.cache_read_input_tokens || 0) * 0.1;
+  const output = usage?.output_tokens || 0;
+  return (input * price.input + output * price.output) / 1e6;
+}
 // サーバー側フォールバック（安全分類器による拒否時に別モデルで再実行）に対応するモデル
 const FALLBACK_MODELS = new Set(['claude-opus-5-5', 'claude-sonnet-5-5']);
 
@@ -88,5 +108,9 @@ export async function reviewAnswer({ apiKey, model, item, sceneName, levelName, 
   const text = res.content.find((b) => b.type === 'text')?.text;
   if (!text) throw new Error('AIから結果を受け取れませんでした。');
   const data = JSON.parse(text);
-  return { verdict: data.verdict, feedback: data.feedback_ja, better: data.better, model: res.model };
+  const usage = {
+    input: (res.usage?.input_tokens || 0) + (res.usage?.cache_creation_input_tokens || 0) + (res.usage?.cache_read_input_tokens || 0),
+    output: res.usage?.output_tokens || 0,
+  };
+  return { verdict: data.verdict, feedback: data.feedback_ja, better: data.better, model: res.model, usage, costUSD: estimateCost(res.model, res.usage, model) };
 }

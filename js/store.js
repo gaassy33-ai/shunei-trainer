@@ -13,11 +13,17 @@ export const DEFAULT_SETTINGS = {
   requeueMissed: true, // 間違えた問題をセッションの最後にもう一度
   autoNext: false, // 正解なら自動で次へ
   strictness: 'normal',
+  recMode: 'auto', // 'auto'（話し終えたら自動で判定）| 'hold'（押している間だけ録音）
+  silenceMs: 2000, // 自動判定で「話し終えた」とみなす無音時間
+  diagnostics: false, // 音声認識の診断ログを表示
   sessionSize: 10,
   sessionMode: 'mix',
   lastLevel: {},
   ai: { enabled: false, apiKey: '', model: 'claude-opus-5-5', auto: true },
 };
+
+// AI添削の累計利用量（トークン数と概算料金）
+const EMPTY_AI_USAGE = { calls: 0, input: 0, output: 0, usd: 0, since: null };
 
 function load() {
   try {
@@ -26,9 +32,10 @@ function load() {
       settings: { ...DEFAULT_SETTINGS, ...(raw.settings || {}), ai: { ...DEFAULT_SETTINGS.ai, ...(raw.settings?.ai || {}) } },
       progress: raw.progress || {},
       log: raw.log || {},
+      aiUsage: { ...EMPTY_AI_USAGE, ...(raw.aiUsage || {}) },
     };
   } catch {
-    return { settings: structuredClone(DEFAULT_SETTINGS), progress: {}, log: {} };
+    return { settings: structuredClone(DEFAULT_SETTINGS), progress: {}, log: {}, aiUsage: { ...EMPTY_AI_USAGE } };
   }
 }
 
@@ -61,6 +68,21 @@ export function importData(json) {
 export function resetProgress() {
   db.progress = {};
   db.log = {};
+  save();
+}
+
+export function addAiUsage({ input, output }, usd) {
+  const u = db.aiUsage;
+  if (!u.since) u.since = new Date().toISOString();
+  u.calls++;
+  u.input += input;
+  u.output += output;
+  u.usd += usd;
+  save();
+}
+
+export function resetAiUsage() {
+  db.aiUsage = { ...EMPTY_AI_USAGE };
   save();
 }
 

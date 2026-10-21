@@ -1,10 +1,10 @@
 // 瞬英トレーナー：画面とトレーニングの進行
 import { LEVELS, CATEGORIES, SCENES, MIXES, ITEMS, ITEM_MAP, sceneById, levelById, scenesOf } from './data/index.js';
-import { db, save, exportData, importData, resetProgress } from './store.js';
+import { db, save, exportData, importData, resetProgress, addAiUsage, resetAiUsage } from './store.js';
 import { grade, tokenize, hintText, STRICTNESS } from './grader.js';
-import { Listener, canRecognize, canSpeak, speak, stopSpeaking, englishVoices, RECOGNITION_ERRORS } from './speech.js';
+import { recognizer, diag, isIOS, canRecognize, canSpeak, speak, stopSpeaking, speechCooldown, englishVoices, RECOGNITION_ERRORS } from './speech.js';
 import { recordResult, buildQueue, poolCounts, overallStats, OUTCOMES, isCorrect, recordOf, MASTERED_BOX } from './srs.js';
-import { reviewAnswer, AI_MODELS } from './ai.js';
+import { reviewAnswer, AI_MODELS, USD_TO_JPY } from './ai.js';
 
 const $app = document.getElementById('app');
 const S = db.settings;
@@ -255,7 +255,6 @@ function levelOption(l, ids) {
 }
 
 // ---------------------------------------------------------------- トレーニング
-let listener = null;
 let rafId = 0;
 let autoNextTimer = 0;
 let tokenSeq = 0;
@@ -284,7 +283,7 @@ function prepareQuestion() {
     item: ITEM_MAP.get(q.id), isRetry: q.retry, token: ++tokenSeq,
     phase: 'answer', attempt: 1, shownAt: 0, reactMs: null, firstReactMs: null,
     hint: 0, hintAtFirst: 0, grade: null, first: null, override: null, gaveUp: false,
-    listening: false, interim: '', micError: '', draft: '', ai: null, noSpeech: 0, committed: false,
+    micState: 'idle', holding: false, manualStop: false, interim: '', micError: '', draft: '', ai: null, noSpeech: 0, committed: false,
   };
 }
 
@@ -292,6 +291,7 @@ async function startQuestion() {
   const c = ui.drill.cur;
   const token = c.token;
   stopSpeaking();
+  diag.mark(`問題 ${ui.drill.idx + 1}${c.attempt > 1 ? `（${c.attempt}回目）` : ''}`);
   if (S.readPrompt && audioAllowed()) {
     setTimerText('問題を読み上げ中…');
     await speak(c.item.ja, { lang: 'ja-JP', rate: 1.05 });
@@ -299,12 +299,12 @@ async function startQuestion() {
   }
   if (!c.shownAt) c.shownAt = performance.now();
   startTimerLoop(token);
-  if (S.inputMode === 'voice' && S.autoMic && canRecognize && window.isSecureContext) startListening();
+  if (S.inputMode === 'voice' && S.autoMic && !holdMode() && canRecognize && window.isSecureContext) startListening();
 }
 
 function teardownDrill() {
-  listener?.abort();
-  listener = null;
+  recognizer.abort();
+  holdEnd(true);
   stopSpeaking();
   cancelAnimationFrame(rafId);
   clearTimeout(autoNextTimer);
@@ -362,17 +362,40 @@ function markReact() {
 }
 
 // ---- 音声入力
-function startListening() {
+const holdMode = () => S.recMode === 'hold';
+
+function startListening({ hold = false } = {}) {
   const c = ui.drill?.cur;
-  if (!c || c.phase !== 'answer' || listener?.active) return;
-  stopSpeaking();
+  if (!c || c.phase !== 'answer' || c.micState !== 'idle') return;
   const token = c.token;
   c.micError = '';
-  const L = new Listener({
-    onStateChange: (on) => {
+  c.manualStop = false;
+  // 模範解答の読み上げ直後はマイクへの切り替えを少し待つ（押して録音のときは待たない）
+  const wait = hold ? 0 : speechCooldown();
+  if (wait) {
+    c.micState = 'starting';
+    diag.push(`読み上げ直後のため ${wait}ms 待ってから録音`);
+    patchVoice(c);
+    setTimeout(() => {
+      if (alive(token) && c.phase === 'answer' && c.micState === 'starting' && !recognizer.busy) beginListening(c, token, hold);
+    }, wait);
+    return;
+  }
+  beginListening(c, token, hold);
+}
+
+function beginListening(c, token, hold) {
+  stopSpeaking();
+  recognizer.start({
+    onStateChange: (state) => {
       if (!alive(token)) return;
-      c.listening = on;
-      if (c.phase === 'answer') render();
+      c.micState = state === 'idle' ? 'idle' : 'starting';
+      if (c.phase === 'answer') patchVoice(c);
+    },
+    onReady: () => {
+      if (!alive(token) || c.phase !== 'answer') return;
+      c.micState = 'ready';
+      patchVoice(c);
     },
     onSpeech: () => { if (alive(token)) markReact(); },
     onInterim: (text) => {
@@ -386,32 +409,88 @@ function startListening() {
     },
     onError: (code) => {
       if (!alive(token) || c.phase !== 'answer') return;
-      // 黙考中に認識がタイムアウトした場合は静かに待ち受けを再開する
-      if (code === 'no-speech' && !L.manualStop && c.reactMs == null && c.noSpeech < 3) {
+      // 黙考中に認識が終わってしまった場合は、静かに待ち受けを再開する
+      if (code === 'no-speech' && !hold && !c.manualStop && c.reactMs == null && c.noSpeech < 3) {
         c.noSpeech++;
-        startListening();
+        diag.push(`無音のため待ち受けを再開（${c.noSpeech}/3）`);
+        setTimeout(() => { if (alive(token) && c.phase === 'answer' && c.micState === 'idle') startListening(); }, 100);
         return;
       }
       if (code === 'aborted') return;
-      c.micError = RECOGNITION_ERRORS[code] || `音声認識エラー（${code}）`;
+      c.micError = code === 'no-speech' && hold
+        ? '声が聞き取れませんでした。ボタンを押したまま話し、話し終えてから離してください。'
+        : RECOGNITION_ERRORS[code] || `音声認識エラー（${code}）`;
       render();
     },
-  });
-  listener = L;
-  L.start();
+  }, { hold, silenceMs: S.silenceMs });
 }
 
+// 自動判定モード：タップで録音開始／終了
 function toggleMic() {
   const c = ui.drill?.cur;
-  if (!c || c.phase !== 'answer') return;
-  if (listener?.active) {
-    listener.manualStop = true;
-    listener.stop();
-  } else {
-    if (!c.shownAt) { c.shownAt = performance.now(); startTimerLoop(c.token); }
-    c.noSpeech = 0;
-    startListening();
+  if (!c || c.phase !== 'answer' || holdMode()) return;
+  if (c.micState !== 'idle') {
+    c.manualStop = true;
+    if (recognizer.busy) recognizer.stop();
+    else { c.micState = 'idle'; patchVoice(c); }
+    return;
   }
+  if (!c.shownAt) { c.shownAt = performance.now(); startTimerLoop(c.token); }
+  c.noSpeech = 0;
+  startListening();
+}
+
+// 押して録音モード：押している間だけ録音し、離したら判定
+function holdStart(e) {
+  const c = ui.drill?.cur;
+  if (!c || c.phase !== 'answer' || !holdMode() || c.holding || !canRecognize) return;
+  e?.preventDefault?.();
+  if (!c.shownAt) { c.shownAt = performance.now(); startTimerLoop(c.token); }
+  c.holding = true;
+  diag.push('ボタンを押した');
+  document.addEventListener('pointerup', onHoldRelease);
+  document.addEventListener('pointercancel', onHoldRelease);
+  if (c.micState !== 'idle') recognizer.abort();
+  c.micState = 'idle';
+  startListening({ hold: true });
+}
+const onHoldRelease = () => holdEnd();
+
+function holdEnd(silent = false) {
+  document.removeEventListener('pointerup', onHoldRelease);
+  document.removeEventListener('pointercancel', onHoldRelease);
+  const c = ui.drill?.cur;
+  if (!c?.holding) return;
+  c.holding = false;
+  if (silent) return;
+  c.manualStop = true;
+  diag.push('ボタンを離した');
+  if (recognizer.busy) recognizer.stop();
+  else if (c.phase === 'answer') { c.micState = 'idle'; patchVoice(c); }
+}
+
+// 録音状態の表示だけを更新する。マイクボタンの要素は差し替えない
+// （押している最中にボタンを作り直すと、iOS で「離した」イベントが届かなくなるため）
+function patchVoice(c) {
+  const box = document.querySelector('.voice-box');
+  const btn = box?.querySelector('.mic-btn');
+  if (!box || !btn || btn.hasAttribute('data-hold-mic') !== holdMode()) { render(); return; }
+  const tmp = document.createElement('div');
+  tmp.innerHTML = voicePanel(c);
+  const fresh = tmp.querySelector('.voice-box');
+  const freshBtn = fresh.querySelector('.mic-btn');
+  btn.className = freshBtn.className;
+  btn.setAttribute('aria-label', freshBtn.getAttribute('aria-label'));
+  const before = [];
+  const after = [];
+  let passed = false;
+  for (const el of [...fresh.children]) {
+    if (el === freshBtn) { passed = true; continue; }
+    (passed ? after : before).push(el);
+  }
+  for (const el of [...box.children]) if (el !== btn) el.remove();
+  btn.before(...before);
+  btn.after(...after);
 }
 
 // ---- 回答・判定
@@ -425,11 +504,12 @@ function submitTyped() {
 function submitAnswer(cands) {
   const c = ui.drill.cur;
   if (c.phase !== 'answer') return;
-  listener?.abort();
-  listener = null;
+  recognizer.abort();
+  holdEnd(true);
   if (c.reactMs == null) markReact();
   c.grade = grade(cands, c.item, S.strictness);
-  c.listening = false;
+  c.micState = 'idle';
+  diag.push(`判定：${Math.round(c.grade.score * 100)}%（${c.grade.verdict}）`);
   if (c.attempt === 1) { c.first = c.grade; c.firstReactMs = c.reactMs; c.hintAtFirst = c.hint; }
   c.phase = 'result';
   render();
@@ -439,10 +519,10 @@ function submitAnswer(cands) {
 function giveUp() {
   const c = ui.drill.cur;
   if (c.phase !== 'answer') return;
-  listener?.abort();
-  listener = null;
+  recognizer.abort();
+  holdEnd(true);
   c.gaveUp = true;
-  c.listening = false;
+  c.micState = 'idle';
   c.grade = grade([], c.item, S.strictness);
   if (c.attempt === 1) { c.first = c.grade; c.firstReactMs = null; c.hintAtFirst = c.hint; }
   c.phase = 'result';
@@ -455,7 +535,9 @@ async function afterGrade() {
   const token = c.token;
   const aiPending = S.ai.enabled && S.ai.auto && S.ai.apiKey && c.grade.userText && c.grade.verdict !== 'correct';
   if (aiPending) runAI();
-  const playing = S.autoPlayAnswer && audioAllowed() ? speakEn(c.item.en) : Promise.resolve();
+  const autoplay = S.autoPlayAnswer && audioAllowed();
+  if (autoplay) diag.push('模範解答を読み上げ');
+  const playing = autoplay ? speakEn(c.item.en) : Promise.resolve();
   if (S.autoNext && isCorrect(attemptOutcome(c)) && !aiPending) {
     await playing;
     if (!alive(token) || c.phase !== 'result') return;
@@ -482,7 +564,7 @@ function retry() {
   if (c.phase !== 'result') return;
   clearTimeout(autoNextTimer);
   stopSpeaking();
-  Object.assign(c, { phase: 'answer', attempt: c.attempt + 1, grade: null, gaveUp: false, interim: '', draft: '', ai: null, micError: '', reactMs: null, noSpeech: 0, token: ++tokenSeq });
+  Object.assign(c, { phase: 'answer', attempt: c.attempt + 1, grade: null, gaveUp: false, interim: '', draft: '', ai: null, micError: '', micState: 'idle', manualStop: false, reactMs: null, shownAt: 0, noSpeech: 0, token: ++tokenSeq });
   render();
   startQuestion();
 }
@@ -546,13 +628,13 @@ function toggleInputMode() {
   save();
   toast(S.inputMode === 'voice' ? '音声入力に切り替えました' : 'キーボード入力に切り替えました（電車モード）');
   if (!c) { render(); return; }
-  listener?.abort();
-  listener = null;
-  c.listening = false;
+  recognizer.abort();
+  holdEnd(true);
+  c.micState = 'idle';
   c.micError = '';
   if (S.inputMode === 'keyboard') stopSpeaking();
   render();
-  if (c.phase === 'answer' && S.inputMode === 'voice' && S.autoMic && canRecognize && c.shownAt) startListening();
+  if (c.phase === 'answer' && S.inputMode === 'voice' && S.autoMic && !holdMode() && canRecognize && c.shownAt) startListening();
 }
 
 // ---- AI添削
@@ -574,6 +656,7 @@ async function runAI() {
       levelName: `Lv${c.item.level} ${levelById(c.item.level).name}`,
       userText: g.userText,
     });
+    addAiUsage(data.usage, data.costUSD);
     if (!alive(token)) return;
     c.ai = { status: 'done', data };
     // AIは判定の引き上げのみ行う（言い換え表現を正解として扱うため）
@@ -599,7 +682,13 @@ function aiBlock(c) {
     <div class="ai-head">${I.spark}<span>AI添削：${head}</span></div>
     <p>${esc(a.data.feedback)}</p>
     ${a.data.better && !same ? `<div class="ai-better"><span class="ai-tag">改善例</span><span>${esc(a.data.better)}</span>${playBtn(a.data.better)}</div>` : ''}
+    <p class="ai-usage">今回：入力 ${a.data.usage.input.toLocaleString()}・出力 ${a.data.usage.output.toLocaleString()} トークン（約 ${yen(a.data.costUSD)}）</p>
   </div>`;
+}
+
+function yen(usd) {
+  const v = usd * USD_TO_JPY;
+  return `${v < 10 ? v.toFixed(2) : Math.round(v).toLocaleString()}円`;
 }
 
 // ---- 描画
@@ -639,20 +728,69 @@ function answerPanel(c, kb) {
     <form class="kbd-form" id="kbdForm" autocomplete="off">
       <textarea id="kbdInput" rows="2" placeholder="英語で入力して Enter" autocapitalize="sentences" spellcheck="false" enterkeyhint="send" aria-label="英文を入力">${esc(c.draft)}</textarea>
       <button class="btn btn-primary" type="submit">回答</button>
-    </form>` : `
-    <div class="voice-box">
-      <div class="transcript ${c.interim ? 'has-text' : ''} ${c.listening ? 'live' : ''}" id="transcript" aria-live="polite">${c.interim ? esc(c.interim) : `<span class="placeholder">${c.listening ? '聞き取り中… 英語で話してください' : canRecognize ? 'マイクをタップして英語で話す' : 'このブラウザは音声認識に対応していません'}</span>`}</div>
-      <button class="mic-btn ${c.listening ? 'on' : ''}" data-act="mic" ${canRecognize ? '' : 'disabled'} aria-label="${c.listening ? '録音を終了して判定' : '録音を開始'}">${I.mic}</button>
-      <p class="mic-caption">${c.listening ? '話し終えると自動で判定します（タップで終了）' : `タップして話す${isDesktop ? '（Space キー）' : ''}`}</p>
-      ${c.micError ? `<p class="notice warn">${esc(c.micError)} <button class="link" data-act="toggle-input">キーボードで答える</button></p>` : ''}
-    </div>`;
+    </form>` : voicePanel(c);
   return `
   ${timer}
   ${body}
   <div class="sub-actions">
     <button class="btn btn-ghost" data-act="hint" ${c.hint >= 2 ? 'disabled' : ''}>${I.bulb}<span>ヒント${c.hint ? `（${c.hint}/2）` : ''}</span></button>
     <button class="btn btn-ghost" data-act="giveup">答えを見る</button>
-  </div>`;
+  </div>
+  ${diagPanel()}`;
+}
+
+function voicePanel(c) {
+  const hold = holdMode();
+  const wait = c.micState === 'starting';
+  const on = c.micState === 'ready';
+  let placeholder;
+  let caption;
+  if (!canRecognize) {
+    placeholder = 'このブラウザは音声認識に対応していません';
+    caption = '';
+  } else if (wait) {
+    placeholder = 'マイクを準備しています…';
+    caption = hold ? '準備中… そのまま押し続けてください' : '準備中…「話してください」と表示されてから話し始めてください';
+  } else if (on) {
+    placeholder = '話してください';
+    caption = hold ? '話し終えたらボタンを離すと判定します' : '話し終えると自動で判定します（タップで終了）';
+  } else {
+    placeholder = hold ? 'ボタンを押している間だけ録音します' : 'マイクをタップして英語で話す';
+    caption = hold ? `押したまま話して、離すと判定${isDesktop ? '（Space キーでも可）' : ''}` : `タップして話す${isDesktop ? '（Space キー）' : ''}`;
+  }
+  const label = hold ? '押している間だけ録音' : on || wait ? '録音を終了して判定' : '録音を開始';
+  return `
+    <div class="voice-box">
+      <div class="transcript ${c.interim ? 'has-text' : ''} ${on ? 'live' : ''} ${wait ? 'wait' : ''}" id="transcript" aria-live="polite">${c.interim ? esc(c.interim) : `<span class="placeholder ${on ? 'go' : ''}">${placeholder}</span>`}</div>
+      <button class="mic-btn ${on ? 'on' : ''} ${wait ? 'wait' : ''} ${hold ? 'hold' : ''}" ${hold ? 'data-hold-mic' : 'data-act="mic"'} ${canRecognize ? '' : 'disabled'} aria-label="${label}">${I.mic}</button>
+      <p class="mic-caption ${on ? 'go' : ''}">${caption}</p>
+      ${c.micError ? `<p class="notice warn">${esc(c.micError)} <button class="link" data-act="toggle-input">キーボードで答える</button></p>` : ''}
+    </div>`;
+}
+
+const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+function diagEnv() {
+  return [
+    isIOS ? 'iOS' : isDesktop ? 'PC' : 'モバイル',
+    recognizer.continuous ? '連続認識' : '単発認識',
+    holdMode() ? '押して録音' : `自動判定（無音 ${(S.silenceMs / 1000).toFixed(1)}秒）`,
+    isStandalone() ? 'ホーム画面から起動' : 'ブラウザで表示',
+    canRecognize ? '認識APIあり' : '認識APIなし',
+  ].join(' / ');
+}
+
+function diagPanel() {
+  if (!S.diagnostics || S.inputMode !== 'voice') return '';
+  return `
+  <details class="diag" ${ui.diagOpen === false ? '' : 'open'}>
+    <summary>診断ログ</summary>
+    <p class="diag-env">${esc(diagEnv())}</p>
+    <pre id="diagLog">${esc(diag.text())}</pre>
+    <div class="inline">
+      <button class="btn btn-secondary btn-sm" data-act="copy-diag">ログをコピー</button>
+      <button class="btn btn-ghost btn-sm" data-act="clear-diag">クリア</button>
+    </div>
+  </details>`;
 }
 
 function resultPanel(c) {
@@ -710,6 +848,7 @@ function resultPanel(c) {
       <button class="chip-btn ${c.override === 'perfect' ? 'on' : ''}" data-act="override" data-val="perfect">◎ 正解にする</button>
       <button class="chip-btn ${c.override === 'miss' ? 'on' : ''}" data-act="override" data-val="miss">× 不正解にする</button>
     </div>
+    ${diagPanel()}
   </section>
   <div class="action-bar">
     <button class="btn btn-secondary" data-act="retry">${I.retry}<span>もう一度</span></button>
@@ -718,6 +857,8 @@ function resultPanel(c) {
 }
 
 function afterDrillRender() {
+  const log = document.getElementById('diagLog');
+  if (log) log.scrollTop = log.scrollHeight;
   const c = ui.drill?.cur;
   if (!c || c.phase !== 'answer') return;
   paintTimer(c);
@@ -871,7 +1012,14 @@ function viewSettings() {
   <section class="set-group">
     <h2>回答</h2>
     <div class="set-row col"><span class="set-text"><b>入力方法</b><small>トレーニング中も右上のボタンで切り替えられます</small></span>${inputModeSeg()}</div>
-    ${toggleRow('autoMic', '出題と同時に録音を開始', '音声モードでマイクボタンを押さずに答えられます')}
+    <div class="set-row col"><span class="set-text"><b>録音のしかた</b><small>iPhone で途中で切れる・認識されないときは「押している間だけ」がおすすめです</small></span>
+      ${seg([{ value: 'auto', label: '話し終えたら自動で判定' }, { value: 'hold', label: '押している間だけ録音' }], S.recMode, 'setting', 'seg-sm', 'data-key="recMode"')}
+    </div>
+    ${S.recMode === 'auto' ? `
+    ${toggleRow('autoMic', '出題と同時に録音を開始', 'マイクボタンを押さずにそのまま答えられます')}
+    <div class="set-row col"><span class="set-text"><b>話し終わりの判定時間</b><small>この時間、新しい言葉が認識されなければ話し終えたとみなします。途中で切れるときは長くしてください</small></span>
+      ${seg([1200, 2000, 3000, 4000].map((v) => ({ value: v, label: `${v / 1000}秒` })), S.silenceMs, 'setting', 'seg-sm', 'data-key="silenceMs" data-num="1"')}
+    </div>` : ''}
     <div class="set-row col"><span class="set-text"><b>制限時間</b><small>日本語が表示されてから話し始める（入力し始める）までの目安</small></span>
       ${seg([{ value: 3, label: '3秒' }, { value: 5, label: '5秒' }, { value: 8, label: '8秒' }, { value: 0, label: 'なし' }], S.timeLimit, 'setting', 'seg-sm', 'data-key="timeLimit" data-num="1"')}
     </div>
@@ -900,6 +1048,12 @@ function viewSettings() {
   </section>
 
   <section class="set-group">
+    <h2>トラブルシューティング</h2>
+    ${toggleRow('diagnostics', '音声認識の診断ログを表示', 'マイクの準備・声の検知・認識結果などのタイミングをトレーニング画面に表示します。うまく認識されないときの原因調査に使います')}
+    <p class="set-desc">${esc(diagEnv())}</p>
+  </section>
+
+  <section class="set-group">
     <h2>学習</h2>
     ${toggleRow('requeueMissed', '間違えた文をセッションの最後にもう一度出す')}
     ${toggleRow('autoNext', '正解したら自動で次の問題へ')}
@@ -916,7 +1070,16 @@ function viewSettings() {
     <div class="set-row col"><span class="set-text"><b>モデル</b></span>
       <select data-set="ai.model" aria-label="AIモデル">${AI_MODELS.map((m) => `<option value="${m.id}" ${S.ai.model === m.id ? 'selected' : ''}>${esc(m.label)}</option>`).join('')}</select>
     </div>
-    ${toggleRow('ai.auto', '不正解・惜しいときは自動で添削', 'オフの場合は結果画面のボタンで依頼します')}` : ''}
+    ${toggleRow('ai.auto', '不正解・惜しいときは自動で添削', 'オフの場合は結果画面のボタンで依頼します')}
+    <div class="set-row col"><span class="set-text"><b>これまでの利用量</b><small>${db.aiUsage.since ? `${new Date(db.aiUsage.since).toLocaleDateString('ja-JP')} から` : 'まだ利用していません'}</small></span>
+      <div class="usage-box">
+        <div><b>${db.aiUsage.calls.toLocaleString()}</b><span>回</span></div>
+        <div><b>${db.aiUsage.input.toLocaleString()}</b><span>入力トークン</span></div>
+        <div><b>${db.aiUsage.output.toLocaleString()}</b><span>出力トークン</span></div>
+        <div><b>${yen(db.aiUsage.usd)}</b><span>概算（$${db.aiUsage.usd.toFixed(3)}）</span></div>
+      </div>
+      <p class="set-note">1ドル＝${USD_TO_JPY}円で換算した概算です。実際の請求額は Anthropic Console で確認できます。 <button class="link" data-act="reset-ai-usage">利用量をリセット</button></p>
+    </div>` : ''}
   </section>
 
   <section class="set-group">
@@ -979,7 +1142,23 @@ const actions = {
     render();
   },
   ai: () => runAI(),
-  play: (el) => { listener?.abort(); speakEn(el.dataset.text); },
+  play: (el) => { if (recognizer.busy) recognizer.abort(); speakEn(el.dataset.text); },
+  'copy-diag': () => {
+    const text = `${diagEnv()}\n${navigator.userAgent}\n${diag.text()}`;
+    (navigator.clipboard?.writeText(text) || Promise.reject())
+      .then(() => toast('診断ログをコピーしました'))
+      .catch(() => {
+        const pre = document.getElementById('diagLog');
+        if (pre) getSelection().selectAllChildren(pre);
+        toast('ログを選択しました。長押しでコピーしてください');
+      });
+  },
+  'clear-diag': () => { diag.lines.length = 0; diag.push('ログをクリア'); },
+  'reset-ai-usage': () => {
+    if (!confirm('AI添削の利用量の記録をリセットしますか？')) return;
+    resetAiUsage();
+    render();
+  },
   'retry-missed': () => {
     const s = ui.lastSession;
     const ids = [...new Set(s.results.filter((r) => !r.retry && !isCorrect(r.outcome)).map((r) => r.id))];
@@ -1076,7 +1255,7 @@ document.addEventListener('keydown', (e) => {
   if (tag === 'BUTTON' && (e.key === 'Enter' || e.code === 'Space')) return;
   const c = ui.drill.cur;
   if (c.phase === 'answer') {
-    if (e.code === 'Space' && S.inputMode === 'voice') { e.preventDefault(); toggleMic(); }
+    if (e.code === 'Space' && S.inputMode === 'voice') { e.preventDefault(); if (holdMode()) holdStart(); else toggleMic(); }
     else if (e.key === 'h') actions.hint();
   } else if (e.key === 'Enter' || e.code === 'Space' || e.key === 'ArrowRight') {
     e.preventDefault();
@@ -1085,11 +1264,35 @@ document.addEventListener('keydown', (e) => {
   else if (e.key === 'p') speakEn(c.item.en);
 });
 
+document.addEventListener('keyup', (e) => {
+  if (ui.view === 'drill' && e.code === 'Space' && holdMode()) holdEnd();
+});
+
+$app.addEventListener('pointerdown', (e) => {
+  const btn = e.target.closest('[data-hold-mic]');
+  if (btn && !btn.disabled) holdStart(e);
+});
+$app.addEventListener('contextmenu', (e) => {
+  if (e.target.closest('[data-hold-mic]')) e.preventDefault();
+});
+// details の開閉状態を再描画後も保つ（toggle はバブリングしないためキャプチャで受ける）
+$app.addEventListener('toggle', (e) => {
+  if (e.target.classList?.contains('diag')) ui.diagOpen = e.target.open;
+}, true);
+
+diag.subscribe(() => {
+  const el = document.getElementById('diagLog');
+  if (el) { el.textContent = diag.text(); el.scrollTop = el.scrollHeight; }
+});
+
 if (canSpeak) speechSynthesis.addEventListener?.('voiceschanged', () => { if (ui.view === 'settings') render(); });
 
 // バックグラウンドに回ったら録音を止める（iOS でマイクが残るのを防ぐ）
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden && listener?.active) listener.stop();
+  if (document.hidden && recognizer.busy) {
+    diag.push('バックグラウンドに移動したため録音を停止');
+    recognizer.stop();
+  }
 });
 
 if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
