@@ -137,3 +137,56 @@ test('abort 後は結果を通知しない', async () => {
   await sleep(60);
   assert.equal(called, false);
 });
+
+test('iOS 向け設定：録音のたびに新しい認識オブジェクトを使い、古いオブジェクトのイベントは無視する', async () => {
+  const rec = new Recognizer({ ...fast, reuse: false });
+  const before = MockSR.count;
+  await session(rec, { silenceMs: 20 }, (sr) => sr.emit([{ final: true, alts: ['one'] }]));
+  const first = MockSR.last;
+  const r = await session(rec, { silenceMs: 20 }, (sr) => sr.emit([{ final: true, alts: ['two'] }]));
+  assert.equal(MockSR.count - before, 2);
+  assert.deepEqual(r.candidates, ['two']);
+  assert.equal(first.onresult, null);
+});
+
+test('マイク入力が始まっても音が届かないときは、マイクを再起動してやり直す', async () => {
+  const rec = new Recognizer({ ...fast, noAudioMs: 40 });
+  let recovered = 0;
+  rec.onRecover = () => { recovered++; return sleep(5); };
+  const before = MockSR.count;
+  const done = session(rec, { silenceMs: 20 });
+  await sleep(120); // 準備完了から noAudioMs 経過 → 中止 → 復旧 → 新しいオブジェクトで再開
+  assert.equal(recovered, 1);
+  assert.equal(MockSR.count - before, 2);
+  MockSR.last.emit([{ final: true, alts: ['it works now'] }]);
+  const r = await done;
+  assert.deepEqual(r.candidates, ['it works now']);
+});
+
+test('音が届いていればマイクを再起動しない', async () => {
+  const rec = new Recognizer({ ...fast, noAudioMs: 40 });
+  let recovered = 0;
+  rec.onRecover = () => { recovered++; };
+  const r = await session(rec, { silenceMs: 80 }, (sr) => sr.emit([{ final: true, alts: ['hello there'] }]));
+  assert.equal(recovered, 0);
+  assert.deepEqual(r.candidates, ['hello there']);
+});
+
+test('録音前の準備処理（Promise）は完了を待ち、不要なときはその場で開始する', async () => {
+  const rec = new Recognizer(fast);
+  let release;
+  rec.beforeStart = () => new Promise((r) => { release = r; });
+  rec.start({}, {});
+  await sleep(10);
+  assert.equal(rec.running, false);
+  release();
+  await sleep(5);
+  assert.equal(rec.running, true);
+  rec.abort();
+  await sleep(20);
+  rec.beforeStart = () => null;
+  rec.start({}, {});
+  assert.equal(rec.running, true); // 同期的に開始（タップ操作の中で start() できる）
+  rec.abort();
+  await sleep(20);
+});

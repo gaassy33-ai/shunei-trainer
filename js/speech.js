@@ -36,11 +36,16 @@ export const diag = {
   subscribe(fn) { this.listeners.add(fn); return () => this.listeners.delete(fn); },
 };
 
-// 認識オブジェクトを1つだけ作って使い回し、1回の発話ごとに「セッション」として扱う。
-// iOS では連続認識（continuous）が不安定なため、1発話ずつ認識する。
+// 1回の発話ごとに「セッション」として認識を管理する。
+// - iOS では連続認識（continuous）が不安定なため、1発話ずつ認識する。
+// - iOS では読み上げ（speechSynthesis）のあと、同じ認識オブジェクトにマイク音声が届かなくなることがあるため、
+//   毎回新しい認識オブジェクトを作る（reuse: false）。
+// - マイク入力が始まっても音が届かない場合は、マイクを再起動して1度だけやり直す（noAudioMs）。
 export class Recognizer {
-  constructor({ lang = 'en-US', continuous = !(isIOS || isAndroid), stopTimeoutMs = 2000, abortTimeoutMs = 800, readyFallbackMs = 1200, maxMs = 25000 } = {}) {
-    Object.assign(this, { lang, continuous, stopTimeoutMs, abortTimeoutMs, readyFallbackMs, maxMs });
+  constructor({ lang = 'en-US', continuous = !(isIOS || isAndroid), reuse = !isIOS, stopTimeoutMs = 2000, abortTimeoutMs = 800, readyFallbackMs = 1200, maxMs = 25000, noAudioMs = 3000 } = {}) {
+    Object.assign(this, { lang, continuous, reuse, stopTimeoutMs, abortTimeoutMs, readyFallbackMs, maxMs, noAudioMs });
+    this.beforeStart = null; // 録音開始前に実行する処理（Promise を返すと完了を待つ）
+    this.onRecover = null; // 音が届かないときの復旧処理
     this.sr = null;
     this.running = false; // エンジンが動作中（onend 待ち）
     this.session = null;
@@ -61,7 +66,7 @@ export class Recognizer {
       if (s && !s.ended) s.readyTimer = setTimeout(() => this._ready(s, 'start+600ms'), 600);
     };
     sr.onaudiostart = () => { diag.push('audiostart（マイク入力開始）'); const s = cur(); if (s) this._ready(s, 'audiostart'); };
-    sr.onsoundstart = () => diag.push('soundstart（音を検知）');
+    sr.onsoundstart = () => { diag.push('soundstart（音を検知）'); const s = cur(); if (s && !s.ended) this._heard(s); };
     sr.onspeechstart = () => { diag.push('speechstart（声を検知）'); const s = cur(); if (s && !s.ended) this._spoke(s); };
     sr.onspeechend = () => diag.push('speechend');
     sr.onaudioend = () => diag.push('audioend');
@@ -70,6 +75,14 @@ export class Recognizer {
     sr.onend = () => this._onEnd();
     this.sr = sr;
     return sr;
+  }
+
+  // 認識オブジェクトを捨てる。後から古いオブジェクトのイベントが届いても影響しないよう、ハンドラも外す
+  _discard() {
+    const old = this.sr;
+    if (!old) return;
+    for (const k of ['onstart', 'onaudiostart', 'onsoundstart', 'onspeechstart', 'onspeechend', 'onaudioend', 'onresult', 'onerror', 'onend']) old[k] = null;
+    this.sr = null;
   }
 
   // handlers: { onStateChange('starting'|'idle'), onReady, onSpeech, onInterim(text), onResult(candidates), onError(code) }
@@ -92,14 +105,21 @@ export class Recognizer {
       s.pendingTimer = setTimeout(() => {
         if (this.pending !== s) return;
         diag.push('前の認識が終了しないため作り直し');
-        this.sr = null;
+        this._discard();
         this.running = false;
         this.halting = false;
         this.pending = null;
         this._begin(s);
       }, this.abortTimeoutMs);
     } else {
-      this._begin(s);
+      let prep = null;
+      try { prep = this.beforeStart?.(); } catch { prep = null; }
+      if (prep && typeof prep.then === 'function') {
+        // 準備が必要なときだけ非同期にする（不要なときはタップ操作の中でそのまま開始する）
+        prep.catch(() => {}).then(() => this._begin(s));
+      } else {
+        this._begin(s);
+      }
     }
     return true;
   }
@@ -107,6 +127,7 @@ export class Recognizer {
   _begin(s, isRestart = false) {
     if (s.ended || this.session !== s) return;
     if (s.stopRequested) { this._finish(s); return; }
+    if (!this.reuse) this._discard();
     let sr = this._ensure();
     sr.lang = this.lang;
     sr.interimResults = true;
@@ -117,7 +138,7 @@ export class Recognizer {
     } catch (err) {
       diag.push(`start() 失敗: ${err?.name || err}`);
       // 状態不整合のときは作り直して1回だけ再試行
-      this.sr = null;
+      this._discard();
       sr = this._ensure();
       sr.lang = this.lang;
       sr.interimResults = true;
@@ -132,7 +153,7 @@ export class Recognizer {
       }
     }
     this.running = true;
-    diag.push(isRestart ? 'start() 再開（押したまま）' : `start() 呼び出し（${this.continuous ? '連続' : '単発'}認識${s.hold ? '・押して録音' : ''}）`);
+    diag.push(isRestart ? 'start() 再開' : `start() 呼び出し（${this.continuous ? '連続' : '単発'}認識${s.hold ? '・押して録音' : ''}${this.reuse ? '' : '・毎回新規'}）`);
     clearTimeout(s.readyFallback);
     s.readyFallback = setTimeout(() => this._ready(s, 'fallback'), this.readyFallbackMs);
     if (!isRestart) s.maxTimer = setTimeout(() => { diag.push('最大録音時間に到達'); this.stop(); }, s.hold ? this.maxMs + 5000 : this.maxMs);
@@ -145,13 +166,37 @@ export class Recognizer {
     clearTimeout(s.readyFallback);
     diag.push(`準備完了（${how}）`);
     s.h.onReady?.();
+    if (this.noAudioMs && !s.heard && !s.recovered) s.noAudioTimer = setTimeout(() => this._noAudio(s), this.noAudioMs);
+  }
+
+  _heard(s) {
+    if (s.heard) return;
+    s.heard = true;
+    clearTimeout(s.noAudioTimer);
   }
 
   _spoke(s) {
+    this._heard(s);
     if (s.spoke) return;
     s.spoke = true;
     this._ready(s, 'speech');
     s.h.onSpeech?.();
+  }
+
+  // マイク入力開始後しばらく音がまったく届かない：マイクを再起動して1度だけやり直す
+  _noAudio(s) {
+    if (s.ended || s.heard || s.recovered || this.session !== s) return;
+    s.recovered = true;
+    diag.push(`${this.noAudioMs}ms 音が届かないため、マイクを再起動`);
+    s.restarting = true;
+    if (this.running) this._halt();
+    else this._restartFresh(s);
+  }
+
+  _restartFresh(s) {
+    s.restarting = false;
+    this._discard();
+    Promise.resolve().then(() => this.onRecover?.()).catch(() => {}).then(() => this._begin(s, true));
   }
 
   _onResult(s, e) {
@@ -195,6 +240,7 @@ export class Recognizer {
     }
     if (!s || s.ended) return;
     clearTimeout(s.silenceTimer);
+    if (s.restarting) { this._restartFresh(s); return; }
     // 押したまま話している途中でエンジンが止まった場合は、続きを認識する
     if (s.hold && s.holding && !s.stopRequested && performance.now() - s.startedAt < this.maxMs) {
       const text = this._bestText(s);
@@ -239,7 +285,7 @@ export class Recognizer {
   _finish(s, errorCode = null) {
     if (s.ended) return;
     s.ended = true;
-    for (const k of ['silenceTimer', 'maxTimer', 'readyTimer', 'readyFallback', 'stopTimer', 'pendingTimer']) clearTimeout(s[k]);
+    for (const k of ['silenceTimer', 'maxTimer', 'readyTimer', 'readyFallback', 'stopTimer', 'pendingTimer', 'noAudioTimer']) clearTimeout(s[k]);
     s.h.onStateChange?.('idle');
     if (s.aborted) return;
     const candidates = errorCode ? [] : this._candidates(s);
@@ -269,7 +315,7 @@ export class Recognizer {
       s.stopTimer = setTimeout(() => {
         if (s.ended) return;
         diag.push('強制停止にも応答なし → 認識オブジェクトを作り直し、途中結果で判定');
-        this.sr = null;
+        this._discard();
         this.running = false;
         this.halting = false;
         this._finish(s);
@@ -291,6 +337,29 @@ export class Recognizer {
 }
 
 export const recognizer = new Recognizer();
+
+// iOS Safari では読み上げ（speechSynthesis）のあとにマイク入力が止まったままになる既知の不具合がある
+// （WebKit Bug 218815）。読み上げのあとは、録音の前にマイクを一度開いて閉じ、入力を復帰させる。
+let spokeSinceRec = false;
+
+export async function resetMicInput() {
+  spokeSinceRec = false;
+  const md = typeof navigator !== 'undefined' ? navigator.mediaDevices : null;
+  if (!md?.getUserMedia) return;
+  const t0 = performance.now();
+  const req = md.getUserMedia({ audio: true }).then((stream) => { stream.getTracks().forEach((t) => t.stop()); });
+  try {
+    await Promise.race([req, new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 1500))]);
+    diag.push(`マイク入力をリセット（${Math.round(performance.now() - t0)}ms）`);
+  } catch (e) {
+    diag.push(`マイク入力のリセットに失敗: ${e?.name || e?.message || e}`);
+  }
+}
+
+if (isIOS) {
+  recognizer.beforeStart = () => (spokeSinceRec ? resetMicInput() : null);
+  recognizer.onRecover = resetMicInput;
+}
 
 // ---- 読み上げ ----
 let voices = [];
@@ -348,6 +417,7 @@ export function speak(text, { lang = 'en-US', rate = 1, voiceURI = '' } = {}) {
     const t = setTimeout(finish, 2500 + text.length * 140 / rate);
     current = u;
     speaking = true;
+    spokeSinceRec = true;
     speechSynthesis.speak(u);
   });
 }

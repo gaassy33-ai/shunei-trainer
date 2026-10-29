@@ -420,6 +420,8 @@ function beginListening(c, token, hold) {
       c.micError = code === 'no-speech' && hold
         ? '声が聞き取れませんでした。ボタンを押したまま話し、話し終えてから離してください。'
         : RECOGNITION_ERRORS[code] || `音声認識エラー（${code}）`;
+      // iPhone では模範解答の読み上げのあとにマイクが使えなくなることがあるため、対処法を案内する
+      c.micErrorAutoplay = code === 'no-speech' && isIOS && S.autoPlayAnswer && audioAllowed();
       render();
     },
   }, { hold, silenceMs: S.silenceMs });
@@ -764,7 +766,8 @@ function voicePanel(c) {
       <div class="transcript ${c.interim ? 'has-text' : ''} ${on ? 'live' : ''} ${wait ? 'wait' : ''}" id="transcript" aria-live="polite">${c.interim ? esc(c.interim) : `<span class="placeholder ${on ? 'go' : ''}">${placeholder}</span>`}</div>
       <button class="mic-btn ${on ? 'on' : ''} ${wait ? 'wait' : ''} ${hold ? 'hold' : ''}" ${hold ? 'data-hold-mic' : 'data-act="mic"'} ${canRecognize ? '' : 'disabled'} aria-label="${label}">${I.mic}</button>
       <p class="mic-caption ${on ? 'go' : ''}">${caption}</p>
-      ${c.micError ? `<p class="notice warn">${esc(c.micError)} <button class="link" data-act="toggle-input">キーボードで答える</button></p>` : ''}
+      ${c.micError ? `<p class="notice warn">${esc(c.micError)}${c.micErrorAutoplay ? '<br>2問目以降で続く場合は、模範解答の読み上げのあとにマイクが止まっている可能性があります。' : ''}
+        <span class="notice-actions">${c.micErrorAutoplay ? '<button class="link" data-act="disable-autoplay">模範解答の自動再生をオフにする</button>' : ''}<button class="link" data-act="toggle-input">キーボードで答える</button></span></p>` : ''}
     </div>`;
 }
 
@@ -1143,6 +1146,14 @@ const actions = {
   },
   ai: () => runAI(),
   play: (el) => { if (recognizer.busy) recognizer.abort(); speakEn(el.dataset.text); },
+  'disable-autoplay': () => {
+    S.autoPlayAnswer = false;
+    save();
+    const c = ui.drill?.cur;
+    if (c) { c.micError = ''; c.micErrorAutoplay = false; }
+    toast('模範解答の自動再生をオフにしました（🔊 ボタンで再生できます）');
+    render();
+  },
   'copy-diag': () => {
     const text = `${diagEnv()}\n${navigator.userAgent}\n${diag.text()}`;
     (navigator.clipboard?.writeText(text) || Promise.reject())

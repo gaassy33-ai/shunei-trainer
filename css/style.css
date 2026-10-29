@@ -111,6 +111,7 @@ h1, h2, p { margin: 0; }
 .link { background: none; border: 0; padding: 0; color: var(--primary); text-decoration: underline; font-weight: 600; }
 .notice { margin-top: 10px; font-size: 13px; line-height: 1.5; padding: 10px 12px; border-radius: var(--radius-sm); background: var(--surface-2); color: var(--muted); }
 .notice.warn { background: var(--warn-soft); color: var(--warn); }
+.notice-actions { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 6px; }
 
 .icon-btn {
   display: inline-grid; place-items: center;

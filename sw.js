@@ -1,5 +1,5 @@
 // オフライン対応：同一オリジンの静的ファイルをキャッシュ（ネットワーク優先）
-const CACHE = 'shunei-v2';
+const CACHE = 'shunei-v3';
 const ASSETS = [
   './',
   "./css/style.css",
