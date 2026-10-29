@@ -190,3 +190,16 @@ test('録音前の準備処理（Promise）は完了を待ち、不要なとき�
   rec.abort();
   await sleep(20);
 });
+
+test('押して録音中は、音が届かなくてもマイクを再起動しない（話している途中で切らない）', async () => {
+  const rec = new Recognizer({ ...fast, noAudioMs: 30 });
+  let recovered = 0;
+  rec.onRecover = () => { recovered++; };
+  const done = session(rec, { hold: true });
+  await sleep(100);
+  assert.equal(recovered, 0);
+  rec.sr.emit([{ final: true, alts: ['long sentence'] }]);
+  rec.stop();
+  const r = await done;
+  assert.deepEqual(r.candidates, ['long sentence']);
+});

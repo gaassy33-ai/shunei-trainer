@@ -1,5 +1,6 @@
 // オフライン対応：同一オリジンの静的ファイルをキャッシュ（ネットワーク優先）
-const CACHE = 'shunei-v3';
+// 更新直後に新旧のファイルが混ざらないよう、毎回サーバーに更新の有無を確認してから使う（cache: 'no-cache'）
+const CACHE = 'shunei-v4';
 const ASSETS = [
   './',
   "./css/style.css",
@@ -30,7 +31,11 @@ const ASSETS = [
 ];
 
 self.addEventListener('install', (e) => {
-  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(ASSETS)).then(() => self.skipWaiting()));
+  e.waitUntil(
+    caches.open(CACHE)
+      .then((c) => c.addAll(ASSETS.map((url) => new Request(url, { cache: 'reload' }))))
+      .then(() => self.skipWaiting()),
+  );
 });
 
 self.addEventListener('activate', (e) => {
@@ -44,8 +49,10 @@ self.addEventListener('activate', (e) => {
 self.addEventListener('fetch', (e) => {
   const req = e.request;
   if (req.method !== 'GET' || new URL(req.url).origin !== self.location.origin) return;
+  // ナビゲーションの Request には RequestInit を付けられないため URL で取得する
+  const fresh = req.mode === 'navigate' ? fetch(req.url, { cache: 'no-cache', credentials: 'same-origin' }) : fetch(req, { cache: 'no-cache' });
   e.respondWith(
-    fetch(req)
+    fresh
       .then((res) => {
         if (res.ok) {
           const copy = res.clone();

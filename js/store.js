@@ -1,6 +1,10 @@
 // 設定・学習記録の永続化（localStorage）
 const KEY = 'shunei-trainer.v1';
 
+// iPhone / iPad（iPadOS は Mac と同じ UA を返すためタッチ対応でも判定）
+const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
+const IS_IOS = /iPhone|iPad|iPod/.test(ua) || (/Macintosh/.test(ua) && typeof navigator !== 'undefined' && navigator.maxTouchPoints > 1);
+
 export const DEFAULT_SETTINGS = {
   inputMode: 'voice', // 'voice' | 'keyboard'
   autoMic: true, // 出題と同時に録音を開始
@@ -13,7 +17,7 @@ export const DEFAULT_SETTINGS = {
   requeueMissed: true, // 間違えた問題をセッションの最後にもう一度
   autoNext: false, // 正解なら自動で次へ
   strictness: 'normal',
-  recMode: 'auto', // 'auto'（話し終えたら自動で判定）| 'hold'（押している間だけ録音）
+  recMode: IS_IOS ? 'dictation' : 'auto', // 'dictation'（キーボードの🎤）| 'auto'（話し終えたら自動で判定）| 'hold'（押している間だけ録音）
   silenceMs: 2000, // 自動判定で「話し終えた」とみなす無音時間
   diagnostics: false, // 音声認識の診断ログを表示
   sessionSize: 10,

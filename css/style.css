@@ -177,6 +177,12 @@ h1, h2, p { margin: 0; }
 .seg-sm > button { min-height: 34px; font-size: 13px; }
 .seg-grid { display: grid; grid-template-columns: 1fr 1fr; }
 .seg-grid > button { flex-direction: column; gap: 0; min-height: 54px; }
+.seg-col { flex-direction: column; }
+.seg-col > button { flex-direction: column; align-items: flex-start; text-align: left; gap: 0; padding: 8px 12px; }
+.seg-col > button b { font-size: 14px; }
+.dictation-tip { margin-bottom: 10px; padding: 10px 14px; border-radius: var(--radius); background: var(--accent-soft); color: var(--text); font-size: 13px; line-height: 1.6; }
+.dictation-tip b { color: var(--accent); font-size: 14px; }
+.dictation-tip p + p { color: var(--muted); font-size: 12px; margin-top: 2px; }
 
 /* ---------- ヘッダー ---------- */
 .topbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 52px; margin-bottom: 12px; }

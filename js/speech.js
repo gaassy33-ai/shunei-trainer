@@ -166,7 +166,7 @@ export class Recognizer {
     clearTimeout(s.readyFallback);
     diag.push(`準備完了（${how}）`);
     s.h.onReady?.();
-    if (this.noAudioMs && !s.heard && !s.recovered) s.noAudioTimer = setTimeout(() => this._noAudio(s), this.noAudioMs);
+    if (this.noAudioMs && !s.hold && !s.heard && !s.recovered) s.noAudioTimer = setTimeout(() => this._noAudio(s), this.noAudioMs);
   }
 
   _heard(s) {

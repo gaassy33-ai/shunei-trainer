@@ -6,6 +6,9 @@ import { recognizer, diag, isIOS, canRecognize, canSpeak, speak, stopSpeaking, s
 import { recordResult, buildQueue, poolCounts, overallStats, OUTCOMES, isCorrect, recordOf, MASTERED_BOX } from './srs.js';
 import { reviewAnswer, AI_MODELS, USD_TO_JPY } from './ai.js';
 
+// 公開版の更新を確認しやすいよう、設定画面と診断ログに表示する
+const APP_VERSION = '2026.10.29';
+
 const $app = document.getElementById('app');
 const S = db.settings;
 const isDesktop = matchMedia('(hover: hover) and (pointer: fine)').matches;
@@ -121,6 +124,8 @@ function inputModeSeg(size = '') {
 
 function voiceNotice() {
   if (S.inputMode !== 'voice') return '';
+  if (S.recMode === 'dictation') return '<p class="notice">キーボードの 🎤（音声入力）で答えるモードです。録音のしかたは設定で変更できます。</p>';
+  if (isIOS) return '<p class="notice">iPhone では、キーボードの 🎤（音声入力）で答えるモードがいちばん確実です。 <button class="link" data-act="use-dictation">切り替える</button></p>';
   if (!canRecognize) return '<p class="notice warn">このブラウザは音声認識に対応していません。Chrome（Android / PC）または Safari（iPhone）でお使いいただくか、キーボード入力をご利用ください。</p>';
   if (!window.isSecureContext) return '<p class="notice warn">音声入力には HTTPS（または localhost）での接続が必要です。</p>';
   return '';
@@ -299,10 +304,11 @@ async function startQuestion() {
   }
   if (!c.shownAt) c.shownAt = performance.now();
   startTimerLoop(token);
-  if (S.inputMode === 'voice' && S.autoMic && !holdMode() && canRecognize && window.isSecureContext) startListening();
+  if (webSpeechMode() && S.autoMic && !holdMode() && canRecognize && window.isSecureContext) startListening();
 }
 
 function teardownDrill() {
+  clearTimeout(dictTimer);
   recognizer.abort();
   holdEnd(true);
   stopSpeaking();
@@ -363,6 +369,10 @@ function markReact() {
 
 // ---- 音声入力
 const holdMode = () => S.recMode === 'hold';
+// キーボードの音声入力（🎤キー）で答えるモード。ブラウザの音声認識 API を使わない
+const dictationMode = () => S.inputMode === 'voice' && S.recMode === 'dictation';
+const webSpeechMode = () => S.inputMode === 'voice' && S.recMode !== 'dictation';
+let dictTimer = 0;
 
 function startListening({ hold = false } = {}) {
   const c = ui.drill?.cur;
@@ -497,15 +507,27 @@ function patchVoice(c) {
 
 // ---- 回答・判定
 function submitTyped() {
+  clearTimeout(dictTimer);
   const el = document.getElementById('kbdInput');
   const v = el?.value.trim();
   if (!v) { toast('英文を入力してください'); el?.focus(); return; }
+  // キーボードが日本語のまま音声入力・入力すると日本語になるため、判定せずに案内する
+  if (/[\u3040-\u30ff\u3400-\u9fff]/.test(v)) {
+    const c = ui.drill.cur;
+    c.draft = '';
+    c.inputWarn = dictationMode()
+      ? '日本語として認識されました。🌐 キーで English キーボードに切り替えてから、🎤 をタップして話してください。'
+      : '日本語が入力されています。英語で入力してください。';
+    render();
+    return;
+  }
   submitAnswer([v]);
 }
 
 function submitAnswer(cands) {
   const c = ui.drill.cur;
   if (c.phase !== 'answer') return;
+  clearTimeout(dictTimer);
   recognizer.abort();
   holdEnd(true);
   if (c.reactMs == null) markReact();
@@ -590,6 +612,7 @@ function next() {
   const d = ui.drill;
   if (!d || d.cur.phase !== 'result') return;
   clearTimeout(autoNextTimer);
+  clearTimeout(dictTimer);
   stopSpeaking();
   commitCurrent();
   d.idx++;
@@ -636,7 +659,7 @@ function toggleInputMode() {
   c.micError = '';
   if (S.inputMode === 'keyboard') stopSpeaking();
   render();
-  if (c.phase === 'answer' && S.inputMode === 'voice' && S.autoMic && !holdMode() && canRecognize && c.shownAt) startListening();
+  if (c.phase === 'answer' && webSpeechMode() && S.autoMic && !holdMode() && canRecognize && c.shownAt) startListening();
 }
 
 // ---- AI添削
@@ -726,11 +749,7 @@ function viewDrill() {
 
 function answerPanel(c, kb) {
   const timer = `<div class="timer" id="timer"><div class="timer-track"><div class="timer-fill" id="timerFill"></div></div><span class="timer-label" id="timerLabel">${c.shownAt ? '' : '準備中…'}</span></div>`;
-  const body = kb ? `
-    <form class="kbd-form" id="kbdForm" autocomplete="off">
-      <textarea id="kbdInput" rows="2" placeholder="英語で入力して Enter" autocapitalize="sentences" spellcheck="false" enterkeyhint="send" aria-label="英文を入力">${esc(c.draft)}</textarea>
-      <button class="btn btn-primary" type="submit">回答</button>
-    </form>` : voicePanel(c);
+  const body = kb ? textForm(c, false) : dictationMode() ? textForm(c, true) : voicePanel(c);
   return `
   ${timer}
   ${body}
@@ -739,6 +758,20 @@ function answerPanel(c, kb) {
     <button class="btn btn-ghost" data-act="giveup">答えを見る</button>
   </div>
   ${diagPanel()}`;
+}
+
+function textForm(c, dictation) {
+  const tip = dictation ? `
+    <div class="dictation-tip">
+      <p><b>キーボードの 🎤 をタップして、英語で話してください</b></p>
+      <p>話し終えて ${(Math.max(S.silenceMs, 1500) / 1000).toFixed(1)} 秒たつと自動で判定します。英語にならないときは 🌐 キーで English キーボードに切り替えてください。</p>
+    </div>` : '';
+  return `${tip}
+    <form class="kbd-form" id="kbdForm" autocomplete="off">
+      <textarea id="kbdInput" rows="2" lang="en" placeholder="${dictation ? '🎤 音声入力の英語がここに入ります' : '英語で入力して Enter'}" autocapitalize="sentences" spellcheck="false" enterkeyhint="send" aria-label="英文を入力">${esc(c.draft)}</textarea>
+      ${c.inputWarn ? `<p class="notice warn" id="inputWarn">${esc(c.inputWarn)}</p>` : ''}
+      <button class="btn btn-primary" type="submit">回答</button>
+    </form>`;
 }
 
 function voicePanel(c) {
@@ -767,23 +800,24 @@ function voicePanel(c) {
       <button class="mic-btn ${on ? 'on' : ''} ${wait ? 'wait' : ''} ${hold ? 'hold' : ''}" ${hold ? 'data-hold-mic' : 'data-act="mic"'} ${canRecognize ? '' : 'disabled'} aria-label="${label}">${I.mic}</button>
       <p class="mic-caption ${on ? 'go' : ''}">${caption}</p>
       ${c.micError ? `<p class="notice warn">${esc(c.micError)}${c.micErrorAutoplay ? '<br>2問目以降で続く場合は、模範解答の読み上げのあとにマイクが止まっている可能性があります。' : ''}
-        <span class="notice-actions">${c.micErrorAutoplay ? '<button class="link" data-act="disable-autoplay">模範解答の自動再生をオフにする</button>' : ''}<button class="link" data-act="toggle-input">キーボードで答える</button></span></p>` : ''}
+        <span class="notice-actions">${isIOS ? '<button class="link" data-act="use-dictation">キーボードの音声入力（🎤）で答える</button>' : ''}${c.micErrorAutoplay ? '<button class="link" data-act="disable-autoplay">模範解答の自動再生をオフにする</button>' : ''}<button class="link" data-act="toggle-input">キーボードで入力する</button></span></p>` : ''}
     </div>`;
 }
 
 const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
 function diagEnv() {
   return [
+    `v${APP_VERSION}`,
     isIOS ? 'iOS' : isDesktop ? 'PC' : 'モバイル',
     recognizer.continuous ? '連続認識' : '単発認識',
-    holdMode() ? '押して録音' : `自動判定（無音 ${(S.silenceMs / 1000).toFixed(1)}秒）`,
+    S.recMode === 'dictation' ? 'キーボードの音声入力' : holdMode() ? '押して録音' : `自動判定（無音 ${(S.silenceMs / 1000).toFixed(1)}秒）`,
     isStandalone() ? 'ホーム画面から起動' : 'ブラウザで表示',
     canRecognize ? '認識APIあり' : '認識APIなし',
   ].join(' / ');
 }
 
 function diagPanel() {
-  if (!S.diagnostics || S.inputMode !== 'voice') return '';
+  if (!S.diagnostics || !webSpeechMode()) return '';
   return `
   <details class="diag" ${ui.diagOpen === false ? '' : 'open'}>
     <summary>診断ログ</summary>
@@ -865,7 +899,7 @@ function afterDrillRender() {
   const c = ui.drill?.cur;
   if (!c || c.phase !== 'answer') return;
   paintTimer(c);
-  if (S.inputMode === 'keyboard') {
+  if (S.inputMode === 'keyboard' || dictationMode()) {
     const el = document.getElementById('kbdInput');
     if (el) {
       el.focus({ preventScroll: true });
@@ -1015,12 +1049,16 @@ function viewSettings() {
   <section class="set-group">
     <h2>回答</h2>
     <div class="set-row col"><span class="set-text"><b>入力方法</b><small>トレーニング中も右上のボタンで切り替えられます</small></span>${inputModeSeg()}</div>
-    <div class="set-row col"><span class="set-text"><b>録音のしかた</b><small>iPhone で途中で切れる・認識されないときは「押している間だけ」がおすすめです</small></span>
-      ${seg([{ value: 'auto', label: '話し終えたら自動で判定' }, { value: 'hold', label: '押している間だけ録音' }], S.recMode, 'setting', 'seg-sm', 'data-key="recMode"')}
+    <div class="set-row col"><span class="set-text"><b>音声で答えるときの方法</b><small>iPhone ではキーボードの 🎤（音声入力）を使う方法がいちばん確実です</small></span>
+      ${seg([
+        { value: 'dictation', html: '<b>キーボードの 🎤 で話す</b><small>iPhone・Android の音声入力を使う（おすすめ）</small>' },
+        { value: 'auto', html: '<b>マイクボタン（自動で判定）</b><small>話し終えると自動で判定</small>' },
+        { value: 'hold', html: '<b>マイクボタン（押している間だけ）</b><small>押したまま話し、離すと判定</small>' },
+      ], S.recMode, 'setting', 'seg-col', 'data-key="recMode"')}
     </div>
-    ${S.recMode === 'auto' ? `
-    ${toggleRow('autoMic', '出題と同時に録音を開始', 'マイクボタンを押さずにそのまま答えられます')}
-    <div class="set-row col"><span class="set-text"><b>話し終わりの判定時間</b><small>この時間、新しい言葉が認識されなければ話し終えたとみなします。途中で切れるときは長くしてください</small></span>
+    ${S.recMode === 'auto' ? toggleRow('autoMic', '出題と同時に録音を開始', 'マイクボタンを押さずにそのまま答えられます') : ''}
+    ${S.recMode !== 'hold' ? `
+    <div class="set-row col"><span class="set-text"><b>話し終わりの判定時間</b><small>この時間、新しい言葉が入らなければ話し終えたとみなします。途中で判定されるときは長くしてください</small></span>
       ${seg([1200, 2000, 3000, 4000].map((v) => ({ value: v, label: `${v / 1000}秒` })), S.silenceMs, 'setting', 'seg-sm', 'data-key="silenceMs" data-num="1"')}
     </div>` : ''}
     <div class="set-row col"><span class="set-text"><b>制限時間</b><small>日本語が表示されてから話し始める（入力し始める）までの目安</small></span>
@@ -1094,7 +1132,7 @@ function viewSettings() {
       <button class="btn btn-danger" data-act="reset">学習記録をリセット</button>
     </div>
   </section>
-  <p class="foot">瞬英トレーナー ・ 全${ITEMS.length}文（${SCENES.length}シーン × 4レベル）</p>`;
+  <p class="foot">瞬英トレーナー ・ バージョン ${APP_VERSION} ・ 全${ITEMS.length}文（${SCENES.length}シーン × 4レベル）</p>`;
 }
 
 function setPath(path, val) {
@@ -1146,6 +1184,19 @@ const actions = {
   },
   ai: () => runAI(),
   play: (el) => { if (recognizer.busy) recognizer.abort(); speakEn(el.dataset.text); },
+  'use-dictation': () => {
+    S.recMode = 'dictation';
+    S.inputMode = 'voice';
+    save();
+    const c = ui.drill?.cur;
+    if (c) {
+      recognizer.abort();
+      holdEnd(true);
+      Object.assign(c, { micState: 'idle', micError: '', micErrorAutoplay: false });
+    }
+    toast('キーボードの 🎤（音声入力）で答えるモードにしました');
+    render();
+  },
   'disable-autoplay': () => {
     S.autoPlayAnswer = false;
     save();
@@ -1219,7 +1270,17 @@ $app.addEventListener('input', (e) => {
   const el = e.target;
   if (el.id === 'kbdInput') {
     const c = ui.drill?.cur;
-    if (c) { c.draft = el.value; if (el.value.trim()) markReact(); }
+    if (c) {
+      c.draft = el.value;
+      if (el.value.trim()) markReact();
+      if (c.inputWarn) { c.inputWarn = ''; document.getElementById('inputWarn')?.remove(); }
+      // キーボードの音声入力：一定時間入力が止まったら話し終えたとみなして判定する
+      clearTimeout(dictTimer);
+      if (dictationMode() && el.value.trim()) {
+        const token = c.token;
+        dictTimer = setTimeout(() => { if (alive(token) && c.phase === 'answer' && dictationMode()) submitTyped(); }, Math.max(S.silenceMs, 1500));
+      }
+    }
   } else if (el.id === 'listSearch') {
     ui.list.q = el.value;
     refreshPhraseList();
@@ -1266,7 +1327,7 @@ document.addEventListener('keydown', (e) => {
   if (tag === 'BUTTON' && (e.key === 'Enter' || e.code === 'Space')) return;
   const c = ui.drill.cur;
   if (c.phase === 'answer') {
-    if (e.code === 'Space' && S.inputMode === 'voice') { e.preventDefault(); if (holdMode()) holdStart(); else toggleMic(); }
+    if (e.code === 'Space' && webSpeechMode()) { e.preventDefault(); if (holdMode()) holdStart(); else toggleMic(); }
     else if (e.key === 'h') actions.hint();
   } else if (e.key === 'Enter' || e.code === 'Space' || e.key === 'ArrowRight') {
     e.preventDefault();
@@ -1276,7 +1337,7 @@ document.addEventListener('keydown', (e) => {
 });
 
 document.addEventListener('keyup', (e) => {
-  if (ui.view === 'drill' && e.code === 'Space' && holdMode()) holdEnd();
+  if (ui.view === 'drill' && e.code === 'Space' && webSpeechMode() && holdMode()) holdEnd();
 });
 
 $app.addEventListener('pointerdown', (e) => {
